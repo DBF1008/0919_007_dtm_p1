@@ -38,6 +38,17 @@ func (t *TransGlobal) process(branches []TransBranch) error {
 			err := t.processInner(ctx, branches)
 			if err != nil && !errors.Is(err, dtmimp.ErrOngoing) {
 				logger.Errorf("processInner err: %v", err)
+				// async processing failed (e.g. a panic recovered by handlePanic),
+				// the trans would be stuck in submitted status forever as an orphan.
+				// reset its cron time so that the cron job can detect and recover it.
+				if !t.IsFinished() {
+					rerr := GetStore().ResetTransGlobalCronTime(&t.TransGlobalStore)
+					if rerr != nil {
+						logger.Errorf("recover orphan trans: %s reset cron time failed: %v", t.Gid, rerr)
+					} else {
+						logger.Infof("recover orphan trans: %s reset cron time ok", t.Gid)
+					}
+				}
 			}
 		}(ctx)
 		return nil

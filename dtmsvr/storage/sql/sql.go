@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/dtm-labs/dtm/client/dtmcli/dtmimp"
@@ -169,33 +170,59 @@ func (s *Store) LockOneGlobalTrans(expireIn time.Duration) *storage.TransGlobalS
 	nextCronTime := getTimeStr(int64(expireIn / time.Second))
 	where := fmt.Sprintf(`next_cron_time < '%s' and status in ('prepared', 'aborting', 'submitted')`, nextCronTime)
 
+	// select the candidate row with FOR UPDATE NOWAIT inside a transaction with
+	// explicit read-committed isolation level, so that concurrent crons will neither
+	// read uncommitted dirty data nor lock the same trans twice.
 	ssql := map[string]string{
-		dtmimp.DBTypeMysql:     fmt.Sprintf(`select id from trans_global where %s order by rand() limit 1`, where),
-		dtmimp.DBTypePostgres:  fmt.Sprintf(`select id from trans_global where %s order by random() limit 1`, where),
-		dtmimp.DBTypeSQLServer: fmt.Sprintf(`select top 1 id from trans_global where %s order by rand()`, where),
+		dtmimp.DBTypeMysql:     fmt.Sprintf(`select id from trans_global where %s order by rand() limit 1 for update nowait`, where),
+		dtmimp.DBTypePostgres:  fmt.Sprintf(`select id from trans_global where %s order by random() limit 1 for update nowait`, where),
+		dtmimp.DBTypeSQLServer: fmt.Sprintf(`select top 1 id from trans_global with(rowlock, updlock, nowait) where %s order by rand()`, where),
 	}[conf.Store.Driver]
-	var id int64
-	err := db.ToSQLDB().QueryRow(ssql).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	dtmimp.PanicIf(err != nil, err)
 
-	sql := fmt.Sprintf(`UPDATE trans_global SET update_time='%s',next_cron_time='%s', owner='%s' WHERE id=%d and %s`,
-		getTimeStr(0),
-		getTimeStr(conf.RetryInterval),
-		owner,
-		id,
-		where)
-	affected, err := dtmimp.DBExec(conf.Store.Driver, db.ToSQLDB(), sql)
-
-	dtmimp.PanicIf(err != nil, err)
-	if affected == 0 {
-		return nil
-	}
 	global := &storage.TransGlobalStore{}
-	db.Must().Where("owner=?", owner).First(global)
+	err := db.Transaction(func(tx *gorm.DB) error {
+		var id int64
+		err := tx.Raw(ssql).Row().Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return storage.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+
+		usql := fmt.Sprintf(`UPDATE trans_global SET update_time='%s',next_cron_time='%s', owner='%s' WHERE id=%d and %s`,
+			getTimeStr(0),
+			getTimeStr(conf.RetryInterval),
+			owner,
+			id,
+			where)
+		dbr := tx.Exec(usql)
+		if dbr.Error != nil {
+			return dbr.Error
+		}
+		if dbr.RowsAffected == 0 {
+			return storage.ErrNotFound
+		}
+		return tx.Where("owner=?", owner).First(global).Error
+	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if errors.Is(err, storage.ErrNotFound) || isNowaitLockError(err) {
+		// no expired trans, or the candidate row is locked by another cron worker
+		return nil
+	}
+	dtmimp.PanicIf(err != nil, err)
 	return global
+}
+
+// isNowaitLockError checks whether the error is caused by a NOWAIT lock conflict,
+// which means another cron worker is processing the trans concurrently.
+func isNowaitLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "3572") || // mysql: ER_LOCK_NOWAIT
+		strings.Contains(msg, "55P03") || // postgres: lock_not_available
+		strings.Contains(strings.ToUpper(msg), "NOWAIT")
 }
 
 // ResetCronTime reset nextCronTime

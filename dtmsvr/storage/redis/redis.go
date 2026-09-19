@@ -68,31 +68,59 @@ func (s *Store) ScanTransGlobalStores(position *string, limit int64, condition s
 	if *position != "" {
 		lid = uint64(dtmimp.MustAtoi(*position))
 	}
+	// filter conditions are passed to the lua script, so that filtering is done
+	// on the redis server side and at most `limit` matched items are returned.
+	// this avoids loading all trans globals into client memory.
+	createTimeStart := ""
+	if !condition.CreateTimeStart.IsZero() {
+		createTimeStart = condition.CreateTimeStart.Format(time.RFC3339Nano)
+	}
+	createTimeEnd := ""
+	if !condition.CreateTimeEnd.IsZero() {
+		createTimeEnd = condition.CreateTimeEnd.Format(time.RFC3339Nano)
+	}
+	lua := `-- ScanTransGlobalStores
+local status = ARGV[1]
+local transType = ARGV[2]
+local createTimeStart = ARGV[3]
+local createTimeEnd = ARGV[4]
+local limit = tonumber(ARGV[5])
+local globals = {}
+for i = 1, #KEYS do
+	local v = redis.call('GET', KEYS[i])
+	if v ~= false then
+		local g = cjson.decode(v)
+		local matched = (status == '' or g['status'] == status)
+			and (transType == '' or g['trans_type'] == transType)
+			and (createTimeStart == '' or (g['create_time'] ~= nil and g['create_time'] > createTimeStart))
+			and (createTimeEnd == '' or (g['create_time'] ~= nil and g['create_time'] < createTimeEnd))
+		if matched then
+			globals[#globals + 1] = v
+			if #globals >= limit then
+				break
+			end
+		end
+	end
+end
+return globals
+`
 	globals := []storage.TransGlobalStore{}
-	redis := redisGet()
+	rdb := redisGet()
 	for {
-		limit -= int64(len(globals))
-		keys, nextCursor, err := redis.Scan(ctx, lid, conf.Store.RedisPrefix+"_g_*", limit).Result()
-		logger.Debugf("calling redis scan: SCAN %d MATCH %s COUNT %d ,scan result: nextCursor:%d keys_len:%d", lid, conf.Store.RedisPrefix+"_g_*", limit, nextCursor, len(keys))
+		remaining := limit - int64(len(globals))
+		keys, nextCursor, err := rdb.Scan(ctx, lid, conf.Store.RedisPrefix+"_g_*", remaining).Result()
+		logger.Debugf("calling redis scan: SCAN %d MATCH %s COUNT %d ,scan result: nextCursor:%d keys_len:%d", lid, conf.Store.RedisPrefix+"_g_*", remaining, nextCursor, len(keys))
 
 		dtmimp.E2P(err)
 
 		if len(keys) > 0 {
-			values, err := redis.MGet(ctx, keys...).Result()
+			values, err := rdb.Eval(ctx, lua, keys,
+				condition.Status, condition.TransType, createTimeStart, createTimeEnd, remaining).StringSlice()
 			dtmimp.E2P(err)
 			for _, v := range values {
 				global := storage.TransGlobalStore{}
-				dtmimp.MustUnmarshalString(v.(string), &global)
-				if (condition.Status == "" || global.Status == condition.Status) &&
-					(condition.TransType == "" || global.TransType == condition.TransType) &&
-					(condition.CreateTimeStart.IsZero() || global.CreateTime.After(condition.CreateTimeStart)) &&
-					(condition.CreateTimeEnd.IsZero() || global.CreateTime.Before(condition.CreateTimeEnd)) {
-					globals = append(globals, global)
-				}
-				// redis.Scan may return more records than limit
-				if len(globals) >= int(limit) {
-					break
-				}
+				dtmimp.MustUnmarshalString(v, &global)
+				globals = append(globals, global)
 			}
 		}
 
@@ -339,8 +367,17 @@ func (s *Store) ResetTransGlobalCronTime(global *storage.TransGlobalStore) error
 	now := dtmutil.GetNextTime(0)
 	global.NextCronTime = now
 	global.UpdateTime = now
-	key := conf.Store.RedisPrefix + "_g_" + global.Gid
-	_, err := redisGet().Set(ctx, key, dtmimp.MustMarshalString(global), time.Duration(conf.Store.DataExpire)*time.Second).Result()
+	args := newArgList().
+		AppendGid(global.Gid).
+		AppendObject(global).
+		AppendRaw(now.Unix()).
+		AppendRaw(global.Gid)
+	// update both the trans global and its score in the cron zset,
+	// so that the cron job can pick up this trans (e.g. an orphan trans) immediately
+	_, err := callLua(args, `-- ResetTransGlobalCronTime
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[2])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+	`)
 	return err
 }
 
