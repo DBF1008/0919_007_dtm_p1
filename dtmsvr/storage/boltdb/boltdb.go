@@ -492,9 +492,11 @@ func (s *Store) ResetTransGlobalCronTime(g *storage.TransGlobalStore) error {
 			return storage.ErrNotFound
 		}
 		now := dtmutil.GetNextTime(0)
+		tDelIndex(t, g.NextCronTime.Unix(), g.Gid)
 		g.NextCronTime = now
 		g.UpdateTime = now
 		tPutGlobal(t, g)
+		tPutIndex(t, now.Unix(), g.Gid)
 		return nil
 	})
 	dtmimp.E2P(err)

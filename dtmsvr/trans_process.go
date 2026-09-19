@@ -38,6 +38,10 @@ func (t *TransGlobal) process(branches []TransBranch) error {
 			err := t.processInner(ctx, branches)
 			if err != nil && !errors.Is(err, dtmimp.ErrOngoing) {
 				logger.Errorf("processInner err: %v", err)
+				// async process failed (e.g. a panic recovered by handlePanic).
+				// reschedule the trans so cron retries it promptly instead of
+				// leaving it stuck in submitted status forever.
+				rescheduleTrans(t.Gid)
 			}
 		}(ctx)
 		return nil
@@ -73,6 +77,22 @@ func (t *TransGlobal) processInner(ctx context.Context, branches []TransBranch) 
 	t.lastTouched = time.Now()
 	rerr = t.getProcessor().ProcessOnce(ctx, branches)
 	return
+}
+
+// rescheduleTrans resets the cron time of an unfinished trans to now, so that
+// the cron loop picks it up again as soon as possible.
+func rescheduleTrans(gid string) {
+	defer handlePanic(nil)
+	global := GetStore().FindTransGlobalStore(gid)
+	if global == nil || global.IsFinished() {
+		return
+	}
+	err := GetStore().ResetTransGlobalCronTime(global)
+	if err != nil {
+		logger.Errorf("reschedule trans err. gid: %s err: %v", gid, err)
+		return
+	}
+	logger.Infof("rescheduled trans after async process failure. gid: %s", gid)
 }
 
 func (t *TransGlobal) saveNew() ([]TransBranch, error) {

@@ -199,3 +199,87 @@ func TestResetTransGlobalCronTime(t *testing.T) {
 	assert.NotEqual(t, g.NextCronTime, g2.NextCronTime)
 	s.ChangeGlobalStatus(g, "succeed", []string{}, true)
 }
+
+func TestScanTransGlobalStores(t *testing.T) {
+	s := registry.GetStore()
+	prefix := dtmimp.GetFuncName()
+	transType := prefix // unique trans type isolates this test's data
+	now := time.Now().Truncate(time.Second)
+	next := now.Add(time.Hour)
+	mkTrans := func(i int, status string) {
+		gid := fmt.Sprintf("%s-%02d", prefix, i)
+		created := now.Add(time.Duration(i) * time.Second)
+		g := &storage.TransGlobalStore{
+			Gid:          gid,
+			Status:       status,
+			TransType:    transType,
+			NextCronTime: &next,
+		}
+		g.CreateTime = &created
+		g.UpdateTime = &created
+		err := s.MaySaveNewTrans(g, []storage.TransBranchStore{{Gid: gid, BranchID: "01"}})
+		assert.Nil(t, err)
+	}
+	// 5 submitted (i=0..4) + 5 succeed (i=5..9)
+	for i := 0; i < 5; i++ {
+		mkTrans(i, "submitted")
+		mkTrans(i+5, "succeed")
+	}
+
+	// scan all of this test's trans
+	position := ""
+	globals := s.ScanTransGlobalStores(&position, 100, storage.TransGlobalScanCondition{TransType: transType})
+	assert.Equal(t, 10, len(globals))
+	assert.Equal(t, "", position)
+
+	// filter by status on the storage side
+	position = ""
+	globals = s.ScanTransGlobalStores(&position, 100, storage.TransGlobalScanCondition{
+		TransType: transType, Status: "submitted",
+	})
+	assert.Equal(t, 5, len(globals))
+	for _, g := range globals {
+		assert.Equal(t, "submitted", g.Status)
+		assert.Equal(t, transType, g.TransType)
+	}
+
+	// limit is respected; paginate until the position is exhausted
+	position = ""
+	seen := map[string]bool{}
+	pages := 0
+	for {
+		globals = s.ScanTransGlobalStores(&position, 4, storage.TransGlobalScanCondition{TransType: transType})
+		assert.LessOrEqual(t, len(globals), 4)
+		for _, g := range globals {
+			assert.False(t, seen[g.Gid], "duplicate gid: %s", g.Gid)
+			seen[g.Gid] = true
+		}
+		pages++
+		if position == "" {
+			break
+		}
+	}
+	assert.Equal(t, 10, len(seen))
+	assert.Equal(t, 3, pages) // 4 + 4 + 2
+
+	// filter by create time range: i in 3..7 (boundaries at half seconds)
+	position = ""
+	globals = s.ScanTransGlobalStores(&position, 100, storage.TransGlobalScanCondition{
+		TransType:       transType,
+		CreateTimeStart: now.Add(2*time.Second + 500*time.Millisecond),
+		CreateTimeEnd:   now.Add(7*time.Second + 500*time.Millisecond),
+	})
+	assert.Equal(t, 5, len(globals))
+	for _, g := range globals {
+		assert.True(t, g.CreateTime.After(now.Add(2*time.Second+500*time.Millisecond)))
+		assert.True(t, g.CreateTime.Before(now.Add(7*time.Second+500*time.Millisecond)))
+	}
+
+	// no match
+	position = ""
+	globals = s.ScanTransGlobalStores(&position, 10, storage.TransGlobalScanCondition{
+		TransType: transType, Status: "aborting",
+	})
+	assert.Equal(t, 0, len(globals))
+	assert.Equal(t, "", position)
+}

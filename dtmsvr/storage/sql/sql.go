@@ -8,10 +8,12 @@
 package sql
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/dtm-labs/dtm/client/dtmcli/dtmimp"
@@ -169,6 +171,10 @@ func (s *Store) LockOneGlobalTrans(expireIn time.Duration) *storage.TransGlobalS
 	nextCronTime := getTimeStr(int64(expireIn / time.Second))
 	where := fmt.Sprintf(`next_cron_time < '%s' and status in ('prepared', 'aborting', 'submitted')`, nextCronTime)
 
+	if conf.Store.Driver == dtmimp.DBTypeMysql || conf.Store.Driver == dtmimp.DBTypePostgres {
+		return lockOneGlobalTransWithRowLock(db, owner, where)
+	}
+
 	ssql := map[string]string{
 		dtmimp.DBTypeMysql:     fmt.Sprintf(`select id from trans_global where %s order by rand() limit 1`, where),
 		dtmimp.DBTypePostgres:  fmt.Sprintf(`select id from trans_global where %s order by random() limit 1`, where),
@@ -196,6 +202,57 @@ func (s *Store) LockOneGlobalTrans(expireIn time.Duration) *storage.TransGlobalS
 	global := &storage.TransGlobalStore{}
 	db.Must().Where("owner=?", owner).First(global)
 	return global
+}
+
+// lockOneGlobalTransWithRowLock locks one expired trans row inside a
+// READ COMMITTED transaction via SELECT ... FOR UPDATE NOWAIT, so a worker
+// never makes decisions on uncommitted dirty data, and concurrent workers
+// never process the same trans. If the row is already locked by another
+// worker, NOWAIT makes the query fail fast and we simply try again next cron.
+func lockOneGlobalTransWithRowLock(db *dtmutil.DB, owner string, where string) *storage.TransGlobalStore {
+	tx, err := db.ToSQLDB().BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	dtmimp.PanicIf(err != nil, err)
+	defer func() { _ = tx.Rollback() }()
+
+	orderBy := map[string]string{
+		dtmimp.DBTypeMysql:    "order by rand()",
+		dtmimp.DBTypePostgres: "order by random()",
+	}[conf.Store.Driver]
+	var id int64
+	lockSQL := fmt.Sprintf(`select id from trans_global where %s %s limit 1 for update nowait`, where, orderBy)
+	err = tx.QueryRow(lockSQL).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		if isRowLockConflict(err) {
+			return nil
+		}
+		dtmimp.PanicIf(err != nil, err)
+	}
+
+	updateSQL := fmt.Sprintf(`update trans_global set update_time='%s', next_cron_time='%s', owner='%s' where id=%d`,
+		getTimeStr(0),
+		getTimeStr(conf.RetryInterval),
+		owner,
+		id)
+	_, err = tx.Exec(updateSQL)
+	dtmimp.PanicIf(err != nil, err)
+	err = tx.Commit()
+	dtmimp.PanicIf(err != nil, err)
+
+	global := &storage.TransGlobalStore{}
+	db.Must().Where("owner=?", owner).First(global)
+	return global
+}
+
+// isRowLockConflict reports whether err is a NOWAIT lock conflict:
+// mysql 8: error 3572 (ER_LOCK_NOWAIT), postgres: 55P03 lock_not_available.
+func isRowLockConflict(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "3572") ||
+		strings.Contains(msg, "lock_not_available") ||
+		strings.Contains(msg, "could not obtain lock")
 }
 
 // ResetCronTime reset nextCronTime

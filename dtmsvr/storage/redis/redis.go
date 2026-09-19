@@ -64,50 +64,197 @@ func (s *Store) FindTransGlobalStore(gid string) *storage.TransGlobalStore {
 // ScanTransGlobalStores lists GlobalTrans data
 func (s *Store) ScanTransGlobalStores(position *string, limit int64, condition storage.TransGlobalScanCondition) []storage.TransGlobalStore {
 	logger.Debugf("calling ScanTransGlobalStores: %s %d", *position, limit)
-	lid := uint64(0)
-	if *position != "" {
-		lid = uint64(dtmimp.MustAtoi(*position))
-	}
+	pos := parseTransScanPosition(*position)
+	ctStart := formatScanTime(condition.CreateTimeStart)
+	ctEnd := formatScanTime(condition.CreateTimeEnd)
 	globals := []storage.TransGlobalStore{}
-	redis := redisGet()
-	for {
-		limit -= int64(len(globals))
-		keys, nextCursor, err := redis.Scan(ctx, lid, conf.Store.RedisPrefix+"_g_*", limit).Result()
-		logger.Debugf("calling redis scan: SCAN %d MATCH %s COUNT %d ,scan result: nextCursor:%d keys_len:%d", lid, conf.Store.RedisPrefix+"_g_*", limit, nextCursor, len(keys))
-
-		dtmimp.E2P(err)
-
-		if len(keys) > 0 {
-			values, err := redis.MGet(ctx, keys...).Result()
-			dtmimp.E2P(err)
-			for _, v := range values {
-				global := storage.TransGlobalStore{}
-				dtmimp.MustUnmarshalString(v.(string), &global)
-				if (condition.Status == "" || global.Status == condition.Status) &&
-					(condition.TransType == "" || global.TransType == condition.TransType) &&
-					(condition.CreateTimeStart.IsZero() || global.CreateTime.After(condition.CreateTimeStart)) &&
-					(condition.CreateTimeEnd.IsZero() || global.CreateTime.Before(condition.CreateTimeEnd)) {
-					globals = append(globals, global)
-				}
-				// redis.Scan may return more records than limit
-				if len(globals) >= int(limit) {
-					break
-				}
-			}
+	// a non-empty position with cursor 0 means the keyspace scan is already
+	// exhausted and only pending keys remain; without this, the scan would
+	// restart from cursor 0 and return duplicates.
+	exhausted := *position != "" && pos.Cursor == 0
+	appendMatches := func(matches []string) {
+		for _, v := range matches {
+			global := storage.TransGlobalStore{}
+			dtmimp.MustUnmarshalString(v, &global)
+			globals = append(globals, global)
 		}
-
-		lid = nextCursor
-		if len(globals) >= int(limit) || nextCursor == 0 {
+	}
+	// all filtering happens on the redis server (lua). memory and network
+	// usage stay bounded by `limit`, no matter how many trans exist.
+	for remaining := limit; remaining > 0; remaining = limit - int64(len(globals)) {
+		if len(pos.Pending) > 0 {
+			matches, pending := filterTransGlobalKeys(pos.Pending, condition, ctStart, ctEnd, remaining)
+			appendMatches(matches)
+			pos.Pending = pending
+			continue
+		}
+		if exhausted {
 			break
 		}
+		cursor, matches, pending := scanTransGlobalsOnServer(pos.Cursor, condition, ctStart, ctEnd, remaining)
+		appendMatches(matches)
+		pos.Cursor = cursor
+		pos.Pending = pending
+		if cursor == 0 {
+			exhausted = true
+		}
 	}
-
-	if lid > 0 {
-		*position = fmt.Sprintf("%d", lid)
-	} else {
-		*position = ""
-	}
+	*position = pos.String()
 	return globals
+}
+
+// transScanPosition is the opaque pagination cursor of ScanTransGlobalStores.
+// SCAN cannot resume in the middle of a batch, so when the limit is hit
+// inside a batch, the unexamined keys are carried over in Pending.
+type transScanPosition struct {
+	Cursor  uint64   `json:"c"`
+	Pending []string `json:"p,omitempty"`
+}
+
+func parseTransScanPosition(s string) transScanPosition {
+	pos := transScanPosition{}
+	if s != "" {
+		dtmimp.MustUnmarshalString(s, &pos)
+	}
+	return pos
+}
+
+func (p transScanPosition) String() string {
+	if p.Cursor == 0 && len(p.Pending) == 0 {
+		return "" // scan exhausted
+	}
+	return dtmimp.MustMarshalString(p)
+}
+
+// formatScanTime formats a scan condition time the same way Go marshals
+// time.Time to JSON (RFC3339Nano, server local timezone), so lua can compare
+// create_time lexically: stored values and condition values are produced by
+// the same server timezone, where lexical order matches chronological order.
+func formatScanTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Local().Format(time.RFC3339Nano)
+}
+
+// luaScanTransGlobals scans the keyspace and filters on the redis server:
+// it GETs every matched key, applies the scan condition and returns at most
+// `limit` matching serialized values, plus the keys of the last batch that
+// were not examined yet (pending), plus the next SCAN cursor. The number of
+// SCAN rounds is capped so one call never blocks redis for too long.
+// KEYS[1] is only a routing key so that cluster clients land on the node
+// that owns the hash-tagged prefix slot.
+const luaScanTransGlobals = `-- scanTransGlobals
+local cursor = tonumber(ARGV[1])
+local pattern = ARGV[2]
+local limit = tonumber(ARGV[3])
+local status = ARGV[4]
+local transType = ARGV[5]
+local ctStart = ARGV[6]
+local ctEnd = ARGV[7]
+local result = {}
+local pending = {}
+local rounds = 0
+local stop = false
+repeat
+	local r = redis.call('SCAN', cursor, 'MATCH', pattern, 'COUNT', 100)
+	cursor = tonumber(r[1])
+	local keys = r[2]
+	for i = 1, #keys do
+		local v = redis.call('GET', keys[i])
+		if v then
+			local g = cjson.decode(v)
+			local ct = g['create_time'] or ''
+			if (status == '' or g['status'] == status)
+				and (transType == '' or g['trans_type'] == transType)
+				and (ctStart == '' or ct > ctStart)
+				and (ctEnd == '' or ct < ctEnd) then
+				result[#result + 1] = v
+				if #result >= limit then
+					for j = i + 1, #keys do
+						pending[#pending + 1] = keys[j]
+					end
+					stop = true
+					break
+				end
+			end
+		end
+	end
+	rounds = rounds + 1
+until stop or cursor == 0 or rounds >= 100
+return {tostring(cursor), result, pending}
+`
+
+// luaFilterTransGlobalKeys applies the scan condition to an explicit list of
+// pending keys on the redis server, returning at most `limit` matching
+// serialized values and the keys that were not examined.
+const luaFilterTransGlobalKeys = `-- filterTransGlobalKeys
+local limit = tonumber(ARGV[1])
+local status = ARGV[2]
+local transType = ARGV[3]
+local ctStart = ARGV[4]
+local ctEnd = ARGV[5]
+local result = {}
+local pending = {}
+for i = 1, #KEYS do
+	local v = redis.call('GET', KEYS[i])
+	if v then
+		local g = cjson.decode(v)
+		local ct = g['create_time'] or ''
+		if (status == '' or g['status'] == status)
+			and (transType == '' or g['trans_type'] == transType)
+			and (ctStart == '' or ct > ctStart)
+			and (ctEnd == '' or ct < ctEnd) then
+			result[#result + 1] = v
+			if #result >= limit then
+				for j = i + 1, #KEYS do
+					pending[#pending + 1] = KEYS[j]
+				end
+				break
+			end
+		end
+	end
+end
+return {result, pending}
+`
+
+// scanTransGlobalsOnServer runs one server-side scan round, returning the
+// next SCAN cursor, the matching serialized trans and the pending keys.
+func scanTransGlobalsOnServer(cursor uint64, condition storage.TransGlobalScanCondition, ctStart string, ctEnd string, limit int64) (uint64, []string, []string) {
+	// the routing key makes cluster clients execute the script on the node
+	// that holds the hash-tagged prefix slot, where all trans keys live
+	keys := []string{conf.Store.RedisPrefix + "_g_"}
+	ret, err := redisGet().Eval(ctx, luaScanTransGlobals, keys,
+		cursor, conf.Store.RedisPrefix+"_g_*", limit,
+		condition.Status, condition.TransType, ctStart, ctEnd).Result()
+	dtmimp.E2P(err)
+	list, ok := ret.([]interface{})
+	dtmimp.PanicIf(!ok || len(list) != 3, fmt.Errorf("unexpected lua scan result: %v", ret))
+	nextCursor, ok := list[0].(string)
+	dtmimp.PanicIf(!ok, fmt.Errorf("unexpected lua scan cursor: %v", list[0]))
+	return uint64(dtmimp.MustAtoi(nextCursor)), toStringList(list[1]), toStringList(list[2])
+}
+
+// filterTransGlobalKeys runs the server-side filter on pending keys,
+// returning the matching serialized trans and the still unexamined keys.
+func filterTransGlobalKeys(keys []string, condition storage.TransGlobalScanCondition, ctStart string, ctEnd string, limit int64) ([]string, []string) {
+	ret, err := redisGet().Eval(ctx, luaFilterTransGlobalKeys, keys,
+		limit, condition.Status, condition.TransType, ctStart, ctEnd).Result()
+	dtmimp.E2P(err)
+	list, ok := ret.([]interface{})
+	dtmimp.PanicIf(!ok || len(list) != 2, fmt.Errorf("unexpected lua filter result: %v", ret))
+	return toStringList(list[0]), toStringList(list[1])
+}
+
+func toStringList(v interface{}) []string {
+	list, _ := v.([]interface{})
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // FindBranches finds Branch data by gid
@@ -339,8 +486,15 @@ func (s *Store) ResetTransGlobalCronTime(global *storage.TransGlobalStore) error
 	now := dtmutil.GetNextTime(0)
 	global.NextCronTime = now
 	global.UpdateTime = now
-	key := conf.Store.RedisPrefix + "_g_" + global.Gid
-	_, err := redisGet().Set(ctx, key, dtmimp.MustMarshalString(global), time.Duration(conf.Store.DataExpire)*time.Second).Result()
+	args := newArgList().
+		AppendGid(global.Gid).
+		AppendObject(global).
+		AppendRaw(now.Unix()).
+		AppendRaw(global.Gid)
+	_, err := callLua(args, `-- ResetTransGlobalCronTime
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[2])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+`)
 	return err
 }
 
